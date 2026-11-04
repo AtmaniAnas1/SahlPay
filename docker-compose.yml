@@ -1,0 +1,158 @@
+name: sahlpay
+
+x-spark-common: &spark-common
+  build: ./docker/spark
+  image: sahlpay/spark:3.5.1
+  volumes:
+    - ./:/opt/project
+    - spark-events:/opt/spark-events
+  environment: &spark-env
+    SAHLPAY_LAKE: s3a://lake
+    KAFKA_BOOTSTRAP: kafka:9092
+    SPARK_NO_DAEMONIZE: "true"
+
+services:
+  # ---------------------------------------------------------------- Kafka (KRaft, sans ZooKeeper)
+  kafka:
+    image: apache/kafka:3.7.0
+    hostname: kafka
+    ports:
+      - "9094:9094"          # accès depuis l'hôte (producer.py lancé hors Docker)
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  kafka-init:
+    image: apache/kafka:3.7.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists \
+          --topic transactions --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic transactions
+    restart: "no"
+
+  # ---------------------------------------------------------------- MinIO (S3) + client mc
+  minio:
+    # les images officielles minio/minio ne sont plus publiées : fork communautaire pgsty (même interface)
+    image: ${MINIO_IMAGE:-pgsty/minio:RELEASE.2026-08-04T00-00-00Z}
+    hostname: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"          # API S3
+      - "9001:9001"          # console web
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # crée le bucket "lake", dépose le référentiel puis reste disponible pour `docker compose exec mc mc ...`
+  mc:
+    image: ${MC_IMAGE:-pgsty/mc:RELEASE.2026-10-26T00-00-00Z}
+    depends_on:
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./data:/data
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://minio:9000 minioadmin minioadmin123
+        mc mb --ignore-existing local/lake
+        mc cp /data/merchants.json local/lake/bronze/referential/merchants.json
+        mc ls --recursive local/lake
+        tail -f /dev/null
+
+  # ---------------------------------------------------------------- Spark standalone : 1 Master + 2 Workers
+  spark-master:
+    <<: *spark-common
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master",
+              "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+
+  spark-worker-1:
+    <<: *spark-common
+    hostname: spark-worker-1
+    depends_on: [spark-master]
+    environment:
+      <<: *spark-env
+      SPARK_WORKER_CORES: 4
+      SPARK_WORKER_MEMORY: 3g
+      SPARK_WORKER_DIR: /tmp/spark-worker
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "--webui-port", "8081", "spark://spark-master:7077"]
+    ports:
+      - "8081:8081"
+
+  spark-worker-2:
+    <<: *spark-common
+    hostname: spark-worker-2
+    depends_on: [spark-master]
+    environment:
+      <<: *spark-env
+      SPARK_WORKER_CORES: 4
+      SPARK_WORKER_MEMORY: 3g
+      SPARK_WORKER_DIR: /tmp/spark-worker
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "--webui-port", "8081", "spark://spark-master:7077"]
+    ports:
+      - "8082:8081"
+
+  spark-history:
+    <<: *spark-common
+    hostname: spark-history
+    depends_on: [spark-master]
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.history.HistoryServer"]
+    ports:
+      - "18080:18080"
+
+  # ---------------------------------------------------------------- Jupyter (driver PySpark)
+  jupyter:
+    <<: *spark-common
+    hostname: jupyter
+    depends_on:
+      spark-master:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+      mc:
+        condition: service_started
+    command: ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser",
+              "--ServerApp.token=", "--ServerApp.password=", "--ServerApp.root_dir=/opt/project"]
+    ports:
+      - "8888:8888"
+      - "4040-4045:4040-4045"   # Spark UI des applications lancées depuis ce conteneur
+
+volumes:
+  minio-data:
+  spark-events:

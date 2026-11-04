@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# données générées (reproductibles avec producer.py)
+data/transactions_history.jsonl
+data/producer_late_events.log
+data/.tx_counter
+
+# sorties d'exécution (à copier dans le rapport)
+outputs/

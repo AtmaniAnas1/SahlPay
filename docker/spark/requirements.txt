@@ -1,0 +1,7 @@
+jupyterlab==4.2.5
+kafka-python==2.0.2
+numpy==1.26.4
+pandas==2.2.2
+pyarrow==16.1.0
+matplotlib==3.9.2
+networkx==3.3
